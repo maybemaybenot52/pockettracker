@@ -1,0 +1,80 @@
+name: Build PocketTracker (click-fix)
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply the click fix
+        run: |
+          cat > /tmp/fix.patch <<'PATCH_EOF'
+          diff --git a/native/audio-defs.h b/native/audio-defs.h
+          index e43d091..b073fca 100644
+          --- a/native/audio-defs.h
+          +++ b/native/audio-defs.h
+          @@ -41,8 +41,9 @@ inline const bool debug_enabled = [] {
+           #  define LOGT(...)
+           #endif
+ 
+          -// One voice per track. Nine lanes (8 = preview) but eight voices: a preview steals a fading one.
+          -const int MAX_VOICES = 8;
+          +// Two slots per track: one sounding, one for the tail of the note it cut. With one slot per track a steal
+          +// on a full pool had nowhere to fade the old note, so it was cut dead (a click). Slots are not tied to tracks.
+          +const int MAX_VOICES = 16;
+ 
+           // ⚠️ Must match songcore/effects.h, where the codes are defined. Only what the table engine runs.
+           const int FX_CHA    = 0x04;  // CHA xy - chance: x for its nearest filled neighbour on the LEFT, y on the RIGHT
+          diff --git a/native/effects/glide.h b/native/effects/glide.h
+          index c8bfeae..bafce73 100644
+          --- a/native/effects/glide.h
+          +++ b/native/effects/glide.h
+          @@ -7,6 +7,7 @@
+           // note starts on its own settings. Anything new follows it, with a length and a form from this file.
+           constexpr int GLIDE_SAMPLES       = 128;  // a setting or a send on a sounding note, ~2.9 ms at 44.1 kHz
+           constexpr int DECLICK_SAMPLES     = 64;   // a note's own start, and a steal: the new note masks it
+          +constexpr int STEAL_FADE_SAMPLES  = 192;  // a note cutting another on its track: the old one's tail, ~4 ms (64 still ticked on low or loud sounds)
+           constexpr int KILL_FADE_SAMPLES   = 256;  // KIL, STOP, an audition let go of: at 64 these still tick
+           constexpr int MUTE_GATE_SAMPLES   = 256;  // MUTE/SOLO, both ways
+           constexpr int FADER_GLIDE_SAMPLES = 256;  // a fader's full swing, by hand, VTR or VMV; a short move is quicker
+          diff --git a/native/engine-mix.cpp b/native/engine-mix.cpp
+          index 52d7a57..931f622 100644
+          --- a/native/engine-mix.cpp
+          +++ b/native/engine-mix.cpp
+          @@ -91,7 +91,7 @@ void AudioEngine::triggerSoundfontNote(const ScheduledNote& note, int frame, int
+               // the sampler trigger does the reverse. Only after armNote said yes.
+               for (int v = 0; v < MAX_VOICES; v++) {
+                   if (voices[v].trackId == t && voices[v].isActive && !voices[v].isFadingOut) {
+          -            voices[v].startFadeOut();
+          +            voices[v].startFadeOut(STEAL_FADE_SAMPLES, frame);
+                   }
+               }
+               sv.isReleasingOnly = false;
+          @@ -185,7 +185,7 @@ void AudioEngine::triggerSamplerNote(const ScheduledNote& note, int frame, int64
+               // Mono per track: whatever is playing here fades from the new note's own frame.
+               for (int v = 0; haveSample && v < MAX_VOICES; v++) {
+                   if (voices[v].trackId == note.trackId && voices[v].isActive && !voices[v].isFadingOut) {
+          -            voices[v].startFadeOut(DECLICK_SAMPLES, frame);
+          +            voices[v].startFadeOut(STEAL_FADE_SAMPLES, frame);
+                   }
+               }
+ 
+          @@ -1109,6 +1109,7 @@ void AudioEngine::mixSamplerPieceAs(Voice& voice, const BlockMix& b, int from, i
+                   float      fo        = 1.0f;
+                   if (fading) {
+                       fo = fadeOut.next();
+          +            fo = fo * fo * (3.0f - 2.0f * fo);   // smoothstep: a linear fade ends in a kink that ticks
+                       voiceFade *= fo;
+                       if (!fadeOut.moving()) {
+                           isFadingOut = false;
+          PATCH_EOF
+          git apply --verbose /tmp/fix.patch
+          git diff --stat
+      - name: Build the PortMaster package (project's own Docker build)
+        run: |
+          docker build -t pockettracker-build -f shell/Dockerfile.portmaster shell/
+          docker run --rm -v "$PWD:/src" pockettracker-build bash /src/shell/build-portmaster.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PocketTracker-clickfix-portmaster
+          path: build/portmaster/pockettracker.zip
